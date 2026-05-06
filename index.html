@@ -619,8 +619,6 @@ uniform float     u_sdfRes;     // voxel grid resolution
 
 out vec4 fragColor;
 
-uniform float u_sdfRes;   // voxel resolution (e.g. 48.0)
-
 // ---- SDF ops ----
 float sdBox(vec3 p, vec3 b) {
     vec3 q = abs(p) - b;
