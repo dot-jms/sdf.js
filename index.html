@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SDF.js — Baker & Viewer</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700&display=swap');
+
+        *, *::before, *::after { box-sizing: border-box; }
+
+        body, html {
+            margin: 0; padding: 0;
+            width: 100%; height: 100%;
+            overflow: hidden;
+            background: #000;
+            font-family: 'Share Tech Mono', monospace;
+        }
+
+        canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+        canvas.dragging { cursor: grabbing; }
+
+        #ui {
+            position: absolute;
+            top: 20px; left: 20px;
+            color: #0ff;
+            background: rgba(0, 8, 16, 0.92);
+            padding: 20px 24px;
+            border: 1px solid #0ff;
+            border-top: 3px solid #0ff;
+            z-index: 10;
+            min-width: 300px;
+            box-shadow: 0 0 30px rgba(0,255,255,0.15), inset 0 0 20px rgba(0,255,255,0.03);
+        }
+
+        #ui h2 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.2em;
+            color: #0ff;
+            margin: 0 0 16px;
+            text-transform: uppercase;
+        }
+
+        .section-label {
+            font-size: 10px;
+            letter-spacing: 0.15em;
+            color: #068;
+            text-transform: uppercase;
+            margin: 14px 0 6px;
+        }
+
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+        .file-btn {
+            display: inline-block;
+            background: transparent;
+            color: #0ff;
+            border: 1px solid #0ff;
+            padding: 6px 12px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+            letter-spacing: 0.05em;
+        }
+        .file-btn:hover { background: rgba(0,255,255,0.1); box-shadow: 0 0 10px rgba(0,255,255,0.3); }
+        .file-btn.accent { border-color: #f0a; color: #f0a; }
+        .file-btn.accent:hover { background: rgba(255,0,170,0.1); box-shadow: 0 0 10px rgba(255,0,170,0.3); }
+        .file-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        input[type="file"] { display: none; }
+
+        .res-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+        select {
+            background: #000;
+            color: #0ff;
+            border: 1px solid #0ff;
+            padding: 5px 8px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        #status {
+            margin-top: 14px;
+            font-size: 11px;
+            color: #8ef;
+            min-height: 16px;
+            letter-spacing: 0.05em;
+        }
+
+        #progressBar {
+            margin-top: 8px;
+            height: 3px;
+            background: #011;
+            width: 100%;
+            display: none;
+        }
+        #progressFill {
+            height: 100%;
+            background: linear-gradient(90deg, #0ff, #0f8);
+            width: 0%;
+            transition: width 0.1s;
+            box-shadow: 0 0 6px #0ff;
+        }
+
+        .hint {
+            margin-top: 10px;
+            font-size: 10px;
+            color: #046;
+            letter-spacing: 0.05em;
+        }
+
+        .scanline {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0,0,0,0.04) 2px,
+                rgba(0,0,0,0.04) 4px
+            );
+            pointer-events: none;
+            z-index: 5;
+        }
+    </style>
+</head>
+<body>
+
+<div class="scanline"></div>
+
+<div id="ui">
+    <h2>SDF.js — Baker & Viewer</h2>
+
+    <div class="section-label">Import</div>
+    <div class="btn-row">
+        <label class="file-btn" for="objInput">[ .obj → bake ]</label>
+        <input type="file" id="objInput" accept=".obj">
+        <label class="file-btn" for="sdfInput">[ load .sdf ]</label>
+        <input type="file" id="sdfInput" accept=".sdf">
+    </div>
+
+    <div class="section-label">Bake Resolution</div>
+    <div class="res-row">
+        <select id="resSelect">
+            <option value="32">32³ — fast draft</option>
+            <option value="48" selected>48³ — balanced</option>
+            <option value="64">64³ — high quality</option>
+            <option value="96">96³ — slow / fine</option>
+        </select>
+    </div>
+
+    <div class="section-label">Export</div>
+    <div class="btn-row">
+        <button class="file-btn accent" id="exportBtn" disabled>[ save .sdf ]</button>
+    </div>
+
+    <div id="status">Ready. Load an .obj to bake, or a .sdf to view.</div>
+    <div id="progressBar"><div id="progressFill"></div></div>
+    <div class="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+</div>
+
+<canvas id="glCanvas"></canvas>
+
+<script>
+/* =========================================================
+   WEB WORKER BLOB — baking runs off the main thread
+   ========================================================= */
+const WORKER_SRC = `
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function dot2(v){return dot(v,v);}
+function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function scale(v,s){return[v[0]*s,v[1]*s,v[2]*s];}
+function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function clamp(v,mn,mx){return Math.max(mn,Math.min(mx,v));}
+
+function distToTriangle(p,v0,v1,v2){
+    const v10=sub(v1,v0),p0=sub(p,v0);
+    const v21=sub(v2,v1),p1=sub(p,v1);
+    const v02=sub(v0,v2),p2=sub(p,v2);
+    const nor=cross(v10,v02);
+    const inFace=(Math.sign(dot(cross(v10,nor),p0))+
+                  Math.sign(dot(cross(v21,nor),p1))+
+                  Math.sign(dot(cross(v02,nor),p2)))>=2.0;
+    let d2;
+    if(inFace){
+        const dn=dot2(nor);
+        if(dn<1e-12)return 0;
+        const nd=dot(nor,p0);
+        d2=nd*nd/dn;
+    } else {
+        const e0=sub(scale(v10,clamp(dot(v10,p0)/dot2(v10),0,1)),p0);
+        const e1=sub(scale(v21,clamp(dot(v21,p1)/dot2(v21),0,1)),p1);
+        const e2=sub(scale(v02,clamp(dot(v02,p2)/dot2(v02),0,1)),p2);
+        d2=Math.min(dot2(e0),dot2(e1),dot2(e2));
+    }
+    return Math.sqrt(Math.max(0,d2));
+}
+
+self.onmessage = function(e) {
+    const { tris, numTris, res } = e.data;
+    const total = res*res*res;
+    const sdfData = new Float32Array(total);
+    const BATCH_Z = 4; // bigger batches are fine off-thread
+    let z = 0;
+
+    function processChunk() {
+        const zEnd = Math.min(z + BATCH_Z, res);
+        for (; z < zEnd; z++) {
+            for (let y = 0; y < res; y++) {
+                for (let x = 0; x < res; x++) {
+                    const p = [
+                        (x/(res-1)-0.5)*2,
+                        (y/(res-1)-0.5)*2,
+                        (z/(res-1)-0.5)*2
+                    ];
+                    let minDist = 1e9;
+                    for (let t = 0; t < numTris; t++) {
+                        const base = t*9;
+                        const d = distToTriangle(p,
+                            [tris[base],   tris[base+1], tris[base+2]],
+                            [tris[base+3], tris[base+4], tris[base+5]],
+                            [tris[base+6], tris[base+7], tris[base+8]]
+                        );
+                        if(d<minDist)minDist=d;
+                    }
+                    sdfData[x + y*res + z*res*res] = minDist;
+                }
+            }
+        }
+        self.postMessage({ type: 'progress', z, res });
+        if (z < res) setTimeout(processChunk, 0);
+        else self.postMessage({ type: 'done', sdfData }, [sdfData.buffer]);
+    }
+    processChunk();
+};
+`;
+
+function createBakeWorker() {
+    const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+    return new Worker(URL.createObjectURL(blob));
+}
+
+/* =========================================================
+   MATH UTILS (main thread, for OBJ parsing)
+   ========================================================= */
+function dot(a, b)  { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+function sub(a, b)  { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function scale(v,s) { return [v[0]*s, v[1]*s, v[2]*s]; }
+function cross(a,b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function clamp(v,mn,mx) { return Math.max(mn, Math.min(mx, v)); }
+
+/* =========================================================
+   OBJ PARSER
+   ========================================================= */
+function parseOBJ(text) {
+    const vertices = [];
+    const indices  = [];
+
+    for (const rawLine of text.split('\n')) {
+        const line  = rawLine.trim();
+        if (!line || line[0] === '#') continue;  // skip blank lines and comments
+        const parts = line.split(/\s+/);
+
+        if (parts[0] === 'v') {
+            const x = parseFloat(parts[1]);
+            const y = parseFloat(parts[2]);
+            const z = parseFloat(parts[3]);
+            // Skip malformed vertex lines (missing or non-numeric tokens)
+            if (isNaN(x) || isNaN(y) || isNaN(z)) continue;
+            vertices.push(x, y, z);
+        } else if (parts[0] === 'f') {
+            const numVerts = vertices.length / 3;
+            const faceVerts = [];
+            for (let i = 1; i < parts.length; i++) {
+                if (!parts[i]) continue;
+                let idx = parseInt(parts[i].split('/')[0], 10);
+                if (isNaN(idx)) continue;
+                // OBJ spec: negative indices count back from the current vertex count
+                if (idx < 0) idx = numVerts + idx;
+                else         idx = idx - 1;          // OBJ is 1-based
+                // Bounds-check — skip this face token if it's out of range
+                if (idx < 0 || idx >= numVerts) continue;
+                faceVerts.push(idx);
+            }
+            // Fan-triangulate; need at least 3 valid corners
+            for (let i = 1; i < faceVerts.length - 1; i++) {
+                indices.push(faceVerts[0], faceVerts[i], faceVerts[i+1]);
+            }
+        }
+    }
+
+    if (vertices.length === 0) throw new Error('No vertices found in OBJ.');
+    if (indices.length  === 0) throw new Error('No faces found in OBJ.');
+
+    let minX=Infinity, minY=Infinity, minZ=Infinity;
+    let maxX=-Infinity, maxY=-Infinity, maxZ=-Infinity;
+    for (let i = 0; i < vertices.length; i += 3) {
+        minX = Math.min(minX, vertices[i]);   maxX = Math.max(maxX, vertices[i]);
+        minY = Math.min(minY, vertices[i+1]); maxY = Math.max(maxY, vertices[i+1]);
+        minZ = Math.min(minZ, vertices[i+2]); maxZ = Math.max(maxZ, vertices[i+2]);
+    }
+    const cx = (minX+maxX)/2, cy = (minY+maxY)/2, cz = (minZ+maxZ)/2;
+    const range = Math.max(maxX-minX, maxY-minY, maxZ-minZ) / 2 || 1;
+    for (let i = 0; i < vertices.length; i += 3) {
+        vertices[i]   = (vertices[i]   - cx) / range;
+        vertices[i+1] = (vertices[i+1] - cy) / range;
+        vertices[i+2] = (vertices[i+2] - cz) / range;
+    }
+
+    return { vertices, indices };
+}
+
+/* =========================================================
+   ASYNC BAKE using Web Worker
+   ========================================================= */
+async function bakeSDF(mesh, res, onProgress) {
+    // Pack triangles into flat Float32Array for transfer
+    const { vertices: verts, indices } = mesh;
+    const numTris = indices.length / 3;
+    const triFlat = new Float32Array(numTris * 9);
+    for (let t = 0; t < numTris; t++) {
+        const i0=indices[t*3]*3, i1=indices[t*3+1]*3, i2=indices[t*3+2]*3;
+        const base = t*9;
+        triFlat[base]   = verts[i0];   triFlat[base+1] = verts[i0+1]; triFlat[base+2] = verts[i0+2];
+        triFlat[base+3] = verts[i1];   triFlat[base+4] = verts[i1+1]; triFlat[base+5] = verts[i1+2];
+        triFlat[base+6] = verts[i2];   triFlat[base+7] = verts[i2+1]; triFlat[base+8] = verts[i2+2];
+    }
+
+    return new Promise((resolve, reject) => {
+        const worker = createBakeWorker();
+        worker.onmessage = (e) => {
+            if (e.data.type === 'progress') {
+                onProgress(e.data.z / e.data.res);
+            } else if (e.data.type === 'done') {
+                worker.terminate();
+                resolve(e.data.sdfData);
+            }
+        };
+        worker.onerror = (err) => { worker.terminate(); reject(err); };
+        worker.postMessage({ tris: triFlat, numTris, res }, [triFlat.buffer]);
+    });
+}
+
+/* =========================================================
+   .SDF FILE FORMAT
+   ========================================================= */
+function encodeSDF(data, res) {
+    const headerBytes = 4 + 3 * 4;
+    const buf = new ArrayBuffer(headerBytes + data.byteLength);
+    const view = new DataView(buf);
+    view.setUint8(0, 0x53); view.setUint8(1, 0x44);
+    view.setUint8(2, 0x46); view.setUint8(3, 0x31);
+    view.setUint32(4,  res, true);
+    view.setUint32(8,  res, true);
+    view.setUint32(12, res, true);
+    new Float32Array(buf, headerBytes).set(data);
+    return buf;
+}
+
+function decodeSDF(buf) {
+    const view = new DataView(buf);
+    const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+    if (magic !== 'SDF1') throw new Error('Not a valid .sdf file (bad magic).');
+    const rx = view.getUint32(4,  true);
+    const ry = view.getUint32(8,  true);
+    const rz = view.getUint32(12, true);
+    if (rx !== ry || ry !== rz) throw new Error('Non-cubic SDF grids not yet supported.');
+    // Copy into a standalone buffer — don't hold a view into the original
+    // ArrayBuffer which may be detached or GC'd after the FileReader completes.
+    const src  = new Float32Array(buf, 16);
+    const data = new Float32Array(src.length);
+    data.set(src);
+    return { data, res: rx };
+}
+
+/* =========================================================
+   WEBGL 2 ENGINE
+   ========================================================= */
+class SDFEngine {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.gl = this.canvas.getContext('webgl2');
+        if (!this.gl) {
+            alert('WebGL 2 not available in this browser. Try Chrome or Firefox.');
+            throw new Error('WebGL2 unavailable');
+        }
+
+        this.program   = null;
+        this.locations = {};
+        this.startTime = Date.now();
+        this.texture   = null;
+        this.sdfRes    = 0;
+
+        // Camera state — spherical coords around origin
+        this.camTheta  = 0.4;   // azimuth (radians)
+        this.camPhi    = 0.3;   // elevation (radians)
+        this.camDist   = 2.2;   // zoom distance
+        this.panX      = 0.0;   // world-space pan offset X
+        this.panY      = 0.0;   // world-space pan offset Y
+        this.autoRotate = true; // spin until user interacts
+
+        window.addEventListener('resize', () => this.resize());
+        this.resize();
+        this._initQuad();
+        this._initCamera();
+    }
+
+    resize() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+        this.canvas.width  = window.innerWidth  * dpr;
+        this.canvas.height = window.innerHeight * dpr;
+        this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    }
+
+    _initQuad() {
+        const gl = this.gl;
+        const positions = new Float32Array([-1,1, 1,1, -1,-1, 1,-1]);
+        this.positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+    }
+
+    _initCamera() {
+        const canvas = this.canvas;
+        let dragging = false;
+        let rightDrag = false;
+        let lastX = 0, lastY = 0;
+
+        canvas.addEventListener('mousedown', (e) => {
+            dragging = true;
+            rightDrag = e.button === 2;
+            lastX = e.clientX; lastY = e.clientY;
+            canvas.classList.add('dragging');
+            this.autoRotate = false;
+        });
+        window.addEventListener('mouseup', () => {
+            dragging = false;
+            canvas.classList.remove('dragging');
+        });
+        window.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - lastX;
+            const dy = e.clientY - lastY;
+            lastX = e.clientX; lastY = e.clientY;
+
+            if (rightDrag) {
+                // Pan
+                const panSpeed = this.camDist * 0.001;
+                this.panX -= dx * panSpeed;
+                this.panY += dy * panSpeed;
+            } else {
+                // Orbit
+                this.camTheta -= dx * 0.005;
+                this.camPhi    = Math.max(-1.4, Math.min(1.4, this.camPhi - dy * 0.005));
+            }
+        });
+
+        // Scroll to zoom toward/from the center
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const factor = e.deltaY > 0 ? 1.08 : 0.925;
+            this.camDist = Math.max(0.4, Math.min(8.0, this.camDist * factor));
+            this.autoRotate = false;
+        }, { passive: false });
+
+        // Prevent context menu on right-click
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Touch support
+        let touches = [];
+        let lastPinchDist = null;
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            touches = Array.from(e.touches);
+            this.autoRotate = false;
+            if (touches.length === 1) {
+                lastX = touches[0].clientX; lastY = touches[0].clientY;
+            }
+        }, { passive: false });
+        canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            const newTouches = Array.from(e.touches);
+            if (newTouches.length === 1) {
+                const dx = newTouches[0].clientX - lastX;
+                const dy = newTouches[0].clientY - lastY;
+                lastX = newTouches[0].clientX; lastY = newTouches[0].clientY;
+                this.camTheta -= dx * 0.005;
+                this.camPhi    = Math.max(-1.4, Math.min(1.4, this.camPhi - dy * 0.005));
+            } else if (newTouches.length === 2) {
+                const d = Math.hypot(
+                    newTouches[0].clientX - newTouches[1].clientX,
+                    newTouches[0].clientY - newTouches[1].clientY
+                );
+                if (lastPinchDist !== null) {
+                    const factor = lastPinchDist / d;
+                    this.camDist = Math.max(0.4, Math.min(8.0, this.camDist * factor));
+                }
+                lastPinchDist = d;
+            }
+            touches = newTouches;
+        }, { passive: false });
+        canvas.addEventListener('touchend', () => { lastPinchDist = null; });
+    }
+
+    _compileShader(type, src) {
+        const gl  = this.gl;
+        const sh  = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+            const err = gl.getShaderInfoLog(sh);
+            gl.deleteShader(sh);
+            throw new Error('Shader compile error:\n' + err);
+        }
+        return sh;
+    }
+
+    load(fsSource) {
+        const gl = this.gl;
+        const vsSource = `#version 300 es
+            in vec4 aVertexPosition;
+            void main() { gl_Position = aVertexPosition; }
+        `;
+
+        const vs = this._compileShader(gl.VERTEX_SHADER, vsSource);
+        const fs = this._compileShader(gl.FRAGMENT_SHADER, fsSource);
+
+        if (this.program) gl.deleteProgram(this.program);
+        this.program = gl.createProgram();
+        gl.attachShader(this.program, vs);
+        gl.attachShader(this.program, fs);
+        gl.linkProgram(this.program);
+        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+            throw new Error('Program link error:\n' + gl.getProgramInfoLog(this.program));
+        }
+
+        gl.useProgram(this.program);
+
+        const posLoc = gl.getAttribLocation(this.program, 'aVertexPosition');
+        gl.enableVertexAttribArray(posLoc);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+        this.locations.res       = gl.getUniformLocation(this.program, 'u_res');
+        this.locations.camPos    = gl.getUniformLocation(this.program, 'u_camPos');
+        this.locations.camTarget = gl.getUniformLocation(this.program, 'u_camTarget');
+        this.locations.modelTex  = gl.getUniformLocation(this.program, 'u_modelTex');
+        this.locations.hasModel  = gl.getUniformLocation(this.program, 'u_hasModel');
+        this.locations.sdfRes    = gl.getUniformLocation(this.program, 'u_sdfRes');
+    }
+
+    updateModel(data, res) {
+        const gl = this.gl;
+        if (this.texture) gl.deleteTexture(this.texture);
+
+        this.texture = gl.createTexture();
+        this.sdfRes  = res;
+        gl.bindTexture(gl.TEXTURE_3D, this.texture);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.R32F, res, res, res, 0, gl.RED, gl.FLOAT, data);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S,     gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T,     gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R,     gl.CLAMP_TO_EDGE);
+    }
+
+    render() {
+        if (!this.program) { requestAnimationFrame(() => this.render()); return; }
+        const gl = this.gl;
+
+        // Auto-rotate when idle
+        if (this.autoRotate) {
+            this.camTheta = (Date.now() - this.startTime) * 0.0004;
+        }
+
+        // Compute camera position from spherical coords
+        const phi = this.camPhi, theta = this.camTheta, r = this.camDist;
+        const camX = r * Math.cos(phi) * Math.sin(theta) + this.panX;
+        const camY = r * Math.sin(phi) + this.panY;
+        const camZ = r * Math.cos(phi) * Math.cos(theta);
+
+        gl.useProgram(this.program);
+        gl.uniform3f(this.locations.res, this.canvas.width, this.canvas.height, 1.0 / this.canvas.height);
+        gl.uniform3f(this.locations.camPos, camX, camY, camZ);
+        gl.uniform3f(this.locations.camTarget, this.panX, this.panY, 0.0);
+        gl.uniform1f(this.locations.sdfRes, this.sdfRes > 0 ? this.sdfRes : 48.0);
+
+        if (this.texture) {
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_3D, this.texture);
+            gl.uniform1i(this.locations.modelTex, 0);
+            gl.uniform1i(this.locations.hasModel, 1);
+        } else {
+            gl.uniform1i(this.locations.hasModel, 0);
+        }
+
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        requestAnimationFrame(() => this.render());
+    }
+}
+
+/* =========================================================
+   FRAGMENT SHADER
+   Camera-driven raymarch — no hardcoded view direction
+   ========================================================= */
+const FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+
+uniform vec3      u_res;
+uniform vec3      u_camPos;     // world-space camera origin
+uniform vec3      u_camTarget;  // world-space look-at point
+uniform sampler3D u_modelTex;
+uniform int       u_hasModel;
+uniform float     u_sdfRes;     // voxel grid resolution
+
+out vec4 fragColor;
+
+uniform float u_sdfRes;   // voxel resolution (e.g. 48.0)
+
+// ---- SDF ops ----
+float sdBox(vec3 p, vec3 b) {
+    vec3 q = abs(p) - b;
+    return length(max(q, 0.)) + min(max(q.x, max(q.y, q.z)), 0.);
+}
+
+float sdSphere(vec3 p, float r) { return length(p) - r; }
+
+float map(vec3 p) {
+    if (u_hasModel == 1) {
+        vec3 uvw = p * 0.5 + 0.5;
+        if (any(greaterThan(uvw, vec3(1.0))) || any(lessThan(uvw, vec3(0.0)))) return 1.0;
+        // The baker stores distances in [-1,1] world space.
+        // One voxel cell spans 2.0/u_sdfRes world units, so the texture value
+        // IS already in world-space units — no rescaling needed.
+        // We render the iso-surface at distance = shell (one half-voxel thick).
+        float shell = 1.2 / u_sdfRes;   // ~half a voxel in world space
+        return texture(u_modelTex, uvw).r - shell;
+    } else {
+        float box = sdBox(p, vec3(0.38));
+        float sph = sdSphere(p, 0.5);
+        return max(box, -sph);
+    }
+}
+
+vec3 getNormal(vec3 p) {
+    float e = u_hasModel == 1 ? 1.5 / u_sdfRes : 0.005;
+    vec2 h = vec2(e, 0.0);
+    return normalize(vec3(
+        map(p + h.xyy) - map(p - h.xyy),
+        map(p + h.yxy) - map(p - h.yxy),
+        map(p + h.yyx) - map(p - h.yyx)
+    ));
+}
+
+float shadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
+    float res = 1.0;
+    float t   = mint;
+    for (int i = 0; i < 32; i++) {
+        float h = map(ro + rd * t);
+        if (h < 0.001) return 0.0;
+        res = min(res, k * h / t);
+        t  += clamp(h, 0.01, 0.1);
+        if (t > maxt) break;
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// Build camera matrix from position + target
+mat3 lookAt(vec3 ro, vec3 ta) {
+    vec3 ww = normalize(ta - ro);
+    vec3 uu = normalize(cross(ww, vec3(0.0, 1.0, 0.0)));
+    vec3 vv = normalize(cross(uu, ww));
+    return mat3(uu, vv, ww);
+}
+
+void main() {
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_res.xy) / u_res.y;
+
+    // Camera derived from uniforms
+    vec3 ro  = u_camPos;
+    mat3 cam = lookAt(ro, u_camTarget);
+    vec3 rd  = cam * normalize(vec3(uv, 1.2));
+
+    // Raymarch
+    float t   = 0.0;
+    bool  hit = false;
+    float minStep = u_hasModel == 1 ? 0.5 / u_sdfRes : 0.0;
+    for (int i = 0; i < 256; i++) {
+        float d = map(ro + rd * t);
+        if (d < 0.0003) { hit = true; break; }
+        if (t > 12.0)   break;
+        t += max(d, minStep);
+    }
+
+    vec3 col = vec3(0.0);
+    if (hit) {
+        vec3 p   = ro + rd * t;
+        vec3 n   = getNormal(p);
+        vec3 lig = normalize(vec3(1.4, 2.0, -1.5));
+
+        float diff = max(dot(n, lig), 0.0);
+        float spec = pow(max(dot(reflect(-lig, n), -rd), 0.0), 24.0);
+        float ao   = clamp(0.5 + 0.5 * n.y, 0.0, 1.0) * 0.4;
+        float sh   = shadow(p + n * 0.01, lig, 0.01, 3.0, 12.0);
+
+        vec3 baseCol = u_hasModel == 1
+            ? vec3(0.05, 0.8, 0.6)
+            : vec3(0.05, 0.5, 1.0);
+
+        col = baseCol * (diff * sh + ao) + vec3(1.0) * spec * 0.5 + baseCol * 0.05;
+    }
+
+    // Background grid
+    vec2 grid = fract(uv * 14.0);
+    float g   = step(0.96, max(grid.x, grid.y)) * 0.04;
+    col      += vec3(0.0, g * 0.6, g);
+
+    // Vignette
+    float vig = 1.0 - dot(uv * 0.7, uv * 0.7);
+    col      *= vig;
+
+    fragColor = vec4(col, 1.0);
+}`;
+
+/* =========================================================
+   APP INIT
+   ========================================================= */
+let engine;
+let lastSdfData = null;
+let lastSdfRes  = 0;
+
+try {
+    engine = new SDFEngine('glCanvas');
+    engine.load(FRAGMENT_SHADER);
+    engine.render();
+} catch(e) {
+    document.getElementById('status').innerText = 'ERROR: ' + e.message;
+}
+
+const status      = document.getElementById('status');
+const progressBar = document.getElementById('progressBar');
+const progressFill= document.getElementById('progressFill');
+const exportBtn   = document.getElementById('exportBtn');
+
+function setProgress(pct) {
+    progressBar.style.display = 'block';
+    progressFill.style.width  = (pct * 100).toFixed(1) + '%';
+    if (pct >= 1) setTimeout(() => { progressBar.style.display = 'none'; }, 600);
+}
+
+/* --- OBJ → bake pipeline --- */
+document.getElementById('objInput').addEventListener('change', async function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    status.innerText = 'Parsing ' + file.name + '...';
+    const text = await file.text();
+
+    let mesh;
+    try {
+        mesh = parseOBJ(text);
+    } catch(err) {
+        status.innerText = 'Parse error: ' + err.message;
+        return;
+    }
+
+    const triCount = mesh.indices.length / 3;
+    const res      = parseInt(document.getElementById('resSelect').value);
+
+    status.innerText = `Baking ${triCount.toLocaleString()} triangles → ${res}³ grid...`;
+    setProgress(0);
+    exportBtn.disabled = true;
+
+    try {
+        const sdfData = await bakeSDF(mesh, res, p => {
+            setProgress(p);
+            status.innerText = `Baking... ${(p*100).toFixed(0)}%  (${triCount.toLocaleString()} tris → ${res}³)`;
+        });
+
+        engine.updateModel(sdfData, res);
+        lastSdfData = sdfData;
+        lastSdfRes  = res;
+        exportBtn.disabled = false;
+        status.innerText = `Done! ${triCount.toLocaleString()} triangles baked at ${res}³. Save with [ save .sdf ]`;
+        setProgress(1);
+    } catch(err) {
+        status.innerText = 'Bake error: ' + err.message;
+        console.error(err);
+    }
+
+    this.value = '';
+});
+
+/* --- .sdf load pipeline --- */
+document.getElementById('sdfInput').addEventListener('change', async function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    status.innerText = 'Loading ' + file.name + '...';
+    const buf = await file.arrayBuffer();
+
+    try {
+        const { data, res } = decodeSDF(buf);
+        engine.updateModel(data, res);
+        lastSdfData = data;
+        lastSdfRes  = res;
+        exportBtn.disabled = false;
+        status.innerText = `Loaded ${file.name} — ${res}³ grid (${(data.byteLength/1024).toFixed(0)} KB)`;
+    } catch(err) {
+        status.innerText = 'Load error: ' + err.message;
+    }
+
+    this.value = '';
+});
+
+/* --- Export .sdf --- */
+exportBtn.addEventListener('click', () => {
+    if (!lastSdfData) return;
+    const buf  = encodeSDF(lastSdfData, lastSdfRes);
+    const blob = new Blob([buf], { type: 'application/octet-stream' });
+    const a    = document.createElement('a');
+    a.href     = URL.createObjectURL(blob);
+    a.download = 'model.sdf';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status.innerText = `Saved model.sdf — ${(buf.byteLength / 1024).toFixed(0)} KB`;
+});
+</script>
+</body>
+</html>
